@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+*.safetensors
+*.bin
+*.ncu-rep
+*.nsys-rep
+results/raw/
+models/
+.pytest_cache/
