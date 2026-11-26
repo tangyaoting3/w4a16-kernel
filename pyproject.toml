@@ -1,0 +1,17 @@
+[project]
+name = "w4a16"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["w4a16*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["gpu: 需要 GPU 的测试"]
