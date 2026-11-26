@@ -26,7 +26,7 @@ def pack_int4(q: torch.Tensor) -> torch.Tensor:
     assert N % PACK == 0
 
     g = (q.reshape(N // PACK, PACK, K).to(torch.int32) & 0xF)   # [N/8, 8, K]
-    packed = torch.zeros(N // PACK, K, dtype=torch.int32)
+    packed = torch.zeros(N // PACK, K, dtype=torch.int32, device=q.device)
     for i in range(PACK):
         packed |= g[:, i, :] << (4 * i)                         # n = 8*nb + i
     return packed.t().contiguous()                              # [K, N//8]

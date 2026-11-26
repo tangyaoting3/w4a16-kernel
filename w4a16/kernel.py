@@ -7,8 +7,9 @@
 
 v0 的设计取舍：
 - 一个 program 负责 BLOCK_NB 个 word（= BLOCK_NB * 8 个输出通道）
-- 外层按 group（G=128）循环，group 内按 BLOCK_K 分块，scale 在 group 内是常数
-- 一个 word 展开 8 个 nibble → 8 个独立累加器，对应 n = 8*nb + i
+- 累加器用二维 [BLOCK_NB, 8]：第 1 维是 word，第 2 维是 nibble 序号 i
+  （Triton 不支持 list comprehension，也不能读模块级 Python 变量，故 G 走 constexpr 参数）
+- 外层按 group 循环，group 内按 BLOCK_K 分块，scale 在 group 内是常数
 - M > 1 由 Python 层循环调用，先保证正确
 """
 from __future__ import annotations
@@ -26,38 +27,45 @@ BLOCK_NB = 16          # 每个 program 处理 16 个 word = 128 个输出通道
 def _w4a16_gemv_kernel(
     x_ptr, qw_ptr, s_ptr, y_ptr,
     K: tl.constexpr, N: tl.constexpr, NB: tl.constexpr,
+    G: tl.constexpr,
     BLOCK_K: tl.constexpr, BLOCK_NB: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    nb = pid * BLOCK_NB + tl.arange(0, BLOCK_NB)      # word 编号
+    iota = tl.arange(0, 8)                              # nibble 序号 i
+
+    nb = pid * BLOCK_NB + tl.arange(0, BLOCK_NB)        # word 编号
     mask_nb = nb < NB
 
-    # 8 个累加器：第 i 个对应输出通道 n = 8*nb + i
-    acc = [tl.zeros([BLOCK_NB], dtype=tl.float32) for _ in range(8)]
+    acc = tl.zeros([BLOCK_NB, 8], dtype=tl.float32)     # [word, i]
 
     for g in range(0, K // G):
-        gacc = [tl.zeros([BLOCK_NB], dtype=tl.float32) for _ in range(8)]
+        gacc = tl.zeros([BLOCK_NB, 8], dtype=tl.float32)
         for kk in range(0, G, BLOCK_K):
-            k = g * G + kk + tl.arange(0, BLOCK_K)                  # [BLOCK_K]
+            k = g * G + kk + tl.arange(0, BLOCK_K)      # [BLOCK_K]
 
-            xk = tl.load(x_ptr + k)                                 # [BLOCK_K] fp32
+            xk = tl.load(x_ptr + k)                     # [BLOCK_K] fp32
             w32 = tl.load(
                 qw_ptr + k[:, None] * NB + nb[None, :],
                 mask=mask_nb[None, :], other=0,
-            )                                                       # [BLOCK_K, BLOCK_NB] int32
+            )                                           # [BLOCK_K, BLOCK_NB] int32
 
-            for i in range(8):
-                q = (w32 >> (4 * i)) & 0xF                          # 无符号 nibble
-                q = tl.where(q >= 8, q - 16, q)                     # 4bit 补码转有符号
-                gacc[i] += tl.sum(q.to(tl.float32) * xk[:, None], axis=0)
+            for i in tl.static_range(8):
+                q = (w32 >> (4 * i)) & 0xF              # 无符号 nibble
+                q = tl.where(q >= 8, q - 16, q)         # 4bit 补码转有符号
+                col = tl.sum(q.to(tl.float32) * xk[:, None], axis=0)   # [BLOCK_NB]
+                gacc += tl.where(iota[None, :] == i, col[:, None], 0.0)
 
         # group 内累加完毕，乘一次该 group 的 scale
-        for i in range(8):
-            s = tl.load(s_ptr + g * N + nb * 8 + i, mask=mask_nb, other=0.0).to(tl.float32)
-            acc[i] += gacc[i] * s
+        s = tl.load(
+            s_ptr + g * N + nb[:, None] * 8 + iota[None, :],
+            mask=mask_nb[:, None], other=0.0,
+        ).to(tl.float32)                                # [BLOCK_NB, 8]
+        acc += gacc * s
 
-    for i in range(8):
-        tl.store(y_ptr + nb * 8 + i, acc[i], mask=mask_nb)
+    tl.store(
+        y_ptr + nb[:, None] * 8 + iota[None, :],
+        acc, mask=mask_nb[:, None],
+    )
 
 
 def w4a16_gemv(x: torch.Tensor, qw: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -74,6 +82,6 @@ def w4a16_gemv(x: torch.Tensor, qw: torch.Tensor, scales: torch.Tensor) -> torch
     for m in range(M):
         _w4a16_gemv_kernel[grid](
             x32[m], qw, scales, y[m],
-            K=K, N=N, NB=NB, BLOCK_K=BLOCK_K, BLOCK_NB=BLOCK_NB,
+            K=K, N=N, NB=NB, G=G, BLOCK_K=BLOCK_K, BLOCK_NB=BLOCK_NB,
         )
     return y
