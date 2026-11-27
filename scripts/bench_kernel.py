@@ -1,17 +1,18 @@
-"""v0 带宽基准测试：测 kernel 的有效带宽 vs 峰值带宽。
+"""带宽基准：对比 v0 / v1(split-K)，同时给出 fp16 cuBLAS 基线。
 
-用法（在仓库根目录）：
-    python scripts/bench_kernel.py                 # 默认 M=1
-    python scripts/bench_kernel.py --M 1 8 32      # 多个 M
-    python scripts/bench_kernel.py --excel results/s1_bandwidth.csv
+用法（仓库根目录）：
+    python scripts/bench_kernel.py                          # 默认 v0 + v1(split=4)
+    python scripts/bench_kernel.py --kernel v0 v1 --split 1 2 4 8
+    python scripts/bench_kernel.py --block-k 256 --split 4 8
 
-指标说明：
-    有效带宽 = 搬运字节 / kernel 耗时
-    带宽利用率 = 有效带宽 / 峰值带宽（5090 为 1792 GB/s）
+指标：
+    有效带宽 = 搬运字节 / 耗时
+    pct      = 有效带宽 / 峰值带宽
+    speedup  = fp16 耗时 / 本 kernel 耗时
 
 注意：
-    M=1 时单层耗时可能只有几微秒，接近 kernel 启动开销（5~10 us），
-    此时带宽比例会被显著低估。看 BIG 那一行（合成大层）更能反映 kernel 本身效率。
+    M=1 时小 shape 的耗时接近 kernel 启动开销（5~10us），pct 会被严重低估；
+    看 BIG 那一行（合成大层，N=16384）更能反映 kernel 本身效率。
 """
 from __future__ import annotations
 
@@ -26,8 +27,9 @@ import triton
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from w4a16.kernel import w4a16_gemv          # noqa: E402
-from w4a16.quantize import gemv_ref, quantize_sym   # noqa: E402
+from w4a16.kernel import w4a16_gemv                    # noqa: E402
+from w4a16.kernel_v1 import w4a16_gemv_v1             # noqa: E402
+from w4a16.quantize import gemv_ref, quantize_sym     # noqa: E402
 
 G = 128
 
@@ -40,13 +42,12 @@ PEAK_BW = {
     "NVIDIA L20": 864.0,
 }
 
-# (name, N, K)  —— 对应 Qwen3-8B 的几类 linear，最后一个是合成大层
 SHAPES = [
     ("q_proj", 4096, 4096),
     ("k_proj", 1024, 4096),
     ("gate_proj", 12288, 4096),
     ("down_proj", 4096, 12288),
-    ("BIG", 16384, 4096),      # 合成：让耗时远离启动开销，反映 kernel 真实效率
+    ("BIG", 16384, 4096),
 ]
 
 
@@ -59,71 +60,82 @@ def fp16_bytes(K: int, N: int, M: int) -> int:
 
 
 def bench(fn) -> float:
-    """返回中位耗时（毫秒）。"""
     return triton.testing.do_bench(fn, warmup=25, rep=100, return_mode="median")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--kernel", nargs="+", default=["v0", "v1"], choices=["v0", "v1"])
+    ap.add_argument("--split", type=int, nargs="+", default=[4])
+    ap.add_argument("--block-k", type=int, default=64)
     ap.add_argument("--M", type=int, nargs="+", default=[1])
     ap.add_argument("--csv", type=str, default="results/s1_bandwidth.csv")
-    ap.add_argument("--peak", type=float, default=None, help="手动指定峰值带宽 GB/s")
-    ap.add_argument("--no-check", action="store_true", help="跳过正确性校验")
+    ap.add_argument("--peak", type=float, default=None)
+    ap.add_argument("--no-check", action="store_true")
     args = ap.parse_args()
 
     dev = "cuda"
     gpu = torch.cuda.get_device_name(0)
     peak = args.peak or PEAK_BW.get(gpu, 1008.0)
+    n_sm = torch.cuda.get_device_properties(0).multi_processor_count
 
-    print(f"GPU   : {gpu}")
+    print(f"GPU   : {gpu}  ({n_sm} SM)")
     print(f"torch : {torch.__version__}   triton: {triton.__version__}")
-    print(f"峰值带宽: {peak} GB/s\n")
+    print(f"峰值带宽: {peak} GB/s   BLOCK_K={args.block_k}\n")
 
     rows = []
-    for M in args.M:
-        for name, N, K in SHAPES:
-            w = torch.randn(N, K, dtype=torch.bfloat16, device=dev)
-            qw, s = quantize_sym(w)
-            x = torch.randn(M, K, dtype=torch.bfloat16, device=dev)
+    for kern in args.kernel:
+        for split in (args.split if kern == "v1" else [1]):
+            for M in args.M:
+                for name, N, K in SHAPES:
+                    if kern == "v1" and K % (split * G) != 0:
+                        print(f"skip  {kern} split={split} {name}: K={K} 不能整除 split*G")
+                        continue
 
-            # 正确性：先确认在测的是对的 kernel
-            if not args.no_check:
-                y1 = w4a16_gemv(x, qw, s)
-                y2 = gemv_ref(x, qw, s)
-                err = ((y1 - y2).abs().max() / y2.abs().max()).item()
-                assert err < 1e-3, f"{name} 结果不对: err={err:.3e}"
+                    w = torch.randn(N, K, dtype=torch.bfloat16, device=dev)
+                    qw, s = quantize_sym(w)
+                    x = torch.randn(M, K, dtype=torch.bfloat16, device=dev)
 
-            t_k = bench(lambda: w4a16_gemv(x, qw, s))
-            b_k = w4a16_bytes(K, N, M)
-            bw_k = b_k / (t_k * 1e-3) / 1e9
+                    call_v0 = lambda: w4a16_gemv(x, qw, s)                    # noqa: E731
+                    call_v1 = lambda: w4a16_gemv_v1(                           # noqa: E731
+                        x, qw, s, split=split, block_k=args.block_k)
+                    fn = call_v0 if kern == "v0" else call_v1
 
-            t_f = bench(lambda: torch.matmul(x, w.t()))
-            b_f = fp16_bytes(K, N, M)
-            bw_f = b_f / (t_f * 1e-3) / 1e9
+                    if not args.no_check:
+                        y2 = gemv_ref(x, qw, s)
+                        y1 = fn()
+                        err = ((y1 - y2).abs().max() / y2.abs().max()).item()
+                        assert err < 1e-3, f"{kern} split={split} {name} 结果不对: err={err:.3e}"
 
-            rows.append(dict(
-                time=time.strftime("%Y-%m-%d %H:%M"),
-                gpu=gpu, M=M, layer=name, N=N, K=K,
-                kernel_us=round(t_k * 1000, 1),
-                kernel_GBs=round(bw_k, 1),
-                kernel_pct=round(bw_k / peak * 100, 1),
-                fp16_us=round(t_f * 1000, 1),
-                fp16_GBs=round(bw_f, 1),
-                fp16_pct=round(bw_f / peak * 100, 1),
-                speedup=round(t_f / t_k, 2),
-            ))
+                    t_k = bench(fn)
+                    bw_k = w4a16_bytes(K, N, M) / (t_k * 1e-3) / 1e9
 
-            print(
-                f"M={M:<3d} {name:<10s} N={N:6d} K={K:6d} | "
-                f"w4a16 {t_k*1000:8.1f}us {bw_k:7.1f} GB/s ({bw_k/peak*100:5.1f}%) | "
-                f"fp16 {t_f*1000:8.1f}us {bw_f:7.1f} GB/s ({bw_f/peak*100:5.1f}%) | "
-                f"speedup {t_f/t_k:5.2f}x"
-            )
+                    t_f = bench(lambda: torch.matmul(x, w.t()))
+                    bw_f = fp16_bytes(K, N, M) / (t_f * 1e-3) / 1e9
 
-            del w, qw, s, x
-            torch.cuda.empty_cache()
+                    rows.append(dict(
+                        time=time.strftime("%Y-%m-%d %H:%M"), gpu=gpu,
+                        kernel=kern, split=(split if kern == "v1" else 1),
+                        block_k=args.block_k, M=M, layer=name, N=N, K=K,
+                        us=round(t_k * 1000, 1),
+                        GBs=round(bw_k, 1),
+                        pct=round(bw_k / peak * 100, 1),
+                        fp16_us=round(t_f * 1000, 1),
+                        fp16_pct=round(bw_f / peak * 100, 1),
+                        speedup=round(t_f / t_k, 2),
+                    ))
 
-    if args.csv:
+                    print(
+                        f"{kern} split={split if kern == 'v1' else 1} M={M:<3d} {name:<10s} "
+                        f"N={N:6d} K={K:6d} | {t_k*1000:8.1f}us {bw_k:7.1f} GB/s "
+                        f"({bw_k/peak*100:5.1f}%) | fp16 {t_f*1000:7.1f}us "
+                        f"({bw_f/peak*100:5.1f}%) | {t_f/t_k:5.2f}x"
+                    )
+
+                    del w, qw, s, x
+                    torch.cuda.empty_cache()
+
+    if args.csv and rows:
         os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -131,12 +143,12 @@ def main() -> None:
             writer.writerows(rows)
         print(f"\n结果已写入 {args.csv}")
 
-    # 一句话结论
     big = [r for r in rows if r["layer"] == "BIG"]
     if big:
-        b = big[0]
-        print(f"结论：v0 在 BIG 上的带宽利用率 = {b['kernel_pct']}%，"
-              f"相对 fp16 提速 {b['speedup']}x")
+        print("\nBIG 层汇总：")
+        for r in big:
+            print(f"  {r['kernel']:2s} split={r['split']:<2d} {r['us']:8.1f}us  "
+                  f"{r['pct']:5.1f}%  {r['speedup']:5.2f}x vs fp16")
 
 
 if __name__ == "__main__":
